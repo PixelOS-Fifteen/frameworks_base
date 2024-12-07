@@ -42,6 +42,7 @@ import com.android.systemui.SysuiTestCase;
 import com.android.systemui.assist.AssistManager;
 import com.android.systemui.emergency.EmergencyGestureModule.EmergencyGestureIntentFactory;
 import com.android.systemui.keyguard.WakefulnessLifecycle;
+import com.android.systemui.keyguard.domain.interactor.KeyguardInteractor;
 import com.android.systemui.plugins.ActivityStarter;
 import com.android.systemui.qs.QSHost;
 import com.android.systemui.recents.ScreenPinningRequest;
@@ -105,6 +106,7 @@ public class CentralSurfacesCommandQueueCallbacksTest extends SysuiTestCase {
     @Mock private ActivityStarter mActivityStarter;
     @Mock private FlashlightController mFlashlightController;
     @Mock private EmergencyGestureIntentFactory mEmergencyGestureIntentFactory;
+    @Mock private KeyguardInteractor mKeyguardInteractor;
 
     CentralSurfacesCommandQueueCallbacks mSbcqCallbacks;
 
@@ -143,6 +145,7 @@ public class CentralSurfacesCommandQueueCallbacksTest extends SysuiTestCase {
                 mQSHost,
                 mActivityStarter,
                 mFlashlightController,
+                mKeyguardInteractor,
                 mEmergencyGestureIntentFactory);
 
         when(mUserTracker.getUserHandle()).thenReturn(

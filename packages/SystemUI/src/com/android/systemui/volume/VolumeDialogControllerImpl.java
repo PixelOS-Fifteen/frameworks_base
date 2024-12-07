@@ -18,6 +18,8 @@ package com.android.systemui.volume;
 
 import static android.media.AudioManager.RINGER_MODE_NORMAL;
 
+import static com.android.settingslib.flags.Flags.volumeDialogAudioSharingFix;
+
 import android.app.ActivityManager;
 import android.app.KeyguardManager;
 import android.app.NotificationManager;
@@ -61,11 +63,14 @@ import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.CaptioningManager;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
 import androidx.lifecycle.Observer;
 
 import com.android.internal.annotations.GuardedBy;
 import com.android.settingslib.volume.MediaSessions;
 import com.android.systemui.Dumpable;
+import com.android.systemui.Flags;
 import com.android.systemui.broadcast.BroadcastDispatcher;
 import com.android.systemui.dagger.SysUISingleton;
 import com.android.systemui.dump.DumpManager;
@@ -78,6 +83,8 @@ import com.android.systemui.statusbar.VibratorHelper;
 import com.android.systemui.util.RingerModeLiveData;
 import com.android.systemui.util.RingerModeTracker;
 import com.android.systemui.util.concurrency.ThreadFactory;
+import com.android.systemui.util.kotlin.JavaAdapter;
+import com.android.systemui.volume.domain.interactor.AudioSharingInteractor;
 
 import dalvik.annotation.optimization.NeverCompile;
 
@@ -104,7 +111,13 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     private static final boolean DEBUG = Log.isLoggable(TAG, Log.DEBUG);
 
     private static final int TOUCH_FEEDBACK_TIMEOUT_MS = 1000;
-    private static final int DYNAMIC_STREAM_START_INDEX = 100;
+    // We only need one dynamic stream for broadcast because at most two headsets are allowed
+    // to join local broadcast in current stage.
+    // It is safe to use 99 as the broadcast stream now. There are only 10+ default audio
+    // streams defined in AudioSystem for now and audio team is in the middle of restructure,
+    // no new default stream is preferred.
+    @VisibleForTesting static final int DYNAMIC_STREAM_BROADCAST = 99;
+    private static final int DYNAMIC_STREAM_REMOTE_START_INDEX = 100;
     private static final AudioAttributes SONIFICIATION_VIBRATION_ATTRIBUTES =
             new AudioAttributes.Builder()
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -115,7 +128,6 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     static final ArrayMap<Integer, Integer> STREAMS = new ArrayMap<>();
     static {
         STREAMS.put(AudioSystem.STREAM_ALARM, R.string.stream_alarm);
-        STREAMS.put(AudioSystem.STREAM_BLUETOOTH_SCO, R.string.stream_bluetooth_sco);
         STREAMS.put(AudioSystem.STREAM_DTMF, R.string.stream_dtmf);
         STREAMS.put(AudioSystem.STREAM_MUSIC, R.string.stream_music);
         STREAMS.put(AudioSystem.STREAM_ACCESSIBILITY, R.string.stream_accessibility);
@@ -144,10 +156,13 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     private final KeyguardManager mKeyguardManager;
     private final ActivityManager mActivityManager;
     private final UserTracker mUserTracker;
+    private final VolumeControllerAdapter mVolumeControllerAdapter;
     protected C mCallbacks = new C();
     private final State mState = new State();
     protected final MediaSessionsCallbacks mMediaSessionsCallbacksW;
     private final VibratorHelper mVibrator;
+    private final AudioSharingInteractor mAudioSharingInteractor;
+    private final JavaAdapter mJavaAdapter;
     private final boolean mHasVibrator;
     private boolean mShowA11yStream;
     private boolean mShowVolumeDialog;
@@ -159,6 +174,7 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
 
     private long mLastToggledRingerOn;
     private boolean mDeviceInteractive = true;
+    boolean mInAudioSharing = false;
 
     private VolumePolicy mVolumePolicy;
     @GuardedBy("this")
@@ -190,13 +206,16 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             NotificationManager notificationManager,
             VibratorHelper vibrator,
             IAudioService iAudioService,
+            VolumeControllerAdapter volumeControllerAdapter,
             AccessibilityManager accessibilityManager,
             PackageManager packageManager,
             WakefulnessLifecycle wakefulnessLifecycle,
             KeyguardManager keyguardManager,
             ActivityManager activityManager,
             UserTracker userTracker,
-            DumpManager dumpManager
+            DumpManager dumpManager,
+            AudioSharingInteractor audioSharingInteractor,
+            JavaAdapter javaAdapter
     ) {
         mContext = context.getApplicationContext();
         mPackageManager = packageManager;
@@ -208,6 +227,8 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
         mRouter2Manager = MediaRouter2Manager.getInstance(mContext);
         mMediaSessionsCallbacksW = new MediaSessionsCallbacks(mContext);
         mMediaSessions = createMediaSessions(mContext, mWorkerLooper, mMediaSessionsCallbacksW);
+        mAudioSharingInteractor = audioSharingInteractor;
+        mJavaAdapter = javaAdapter;
         mAudio = audioManager;
         mNoMan = notificationManager;
         mObserver = new SettingObserver(mWorker);
@@ -222,6 +243,7 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
         mVibrator = vibrator;
         mHasVibrator = mVibrator.hasVibrator();
         mAudioService = iAudioService;
+        mVolumeControllerAdapter = volumeControllerAdapter;
         mKeyguardManager = keyguardManager;
         mActivityManager = activityManager;
         mUserTracker = userTracker;
@@ -253,10 +275,14 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     }
 
     protected void setVolumeController() {
-        try {
-            mAudio.setVolumeController(mVolumeController);
-        } catch (SecurityException e) {
-            Log.w(TAG, "Unable to set the volume controller", e);
+        if (Flags.useVolumeController()) {
+            mVolumeControllerAdapter.collectToController(mVolumeController);
+        } else {
+            try {
+                mAudio.setVolumeController(mVolumeController);
+            } catch (SecurityException e) {
+                Log.w(TAG, "Unable to set the volume controller", e);
+            }
         }
     }
 
@@ -284,6 +310,15 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             mMediaSessions.init();
         } catch (SecurityException e) {
             Log.w(TAG, "No access to media sessions", e);
+        }
+        if (volumeDialogAudioSharingFix()) {
+            Slog.d(TAG, "Start collect volume changes in audio sharing");
+            mJavaAdapter.alwaysCollectFlow(
+                    mAudioSharingInteractor.getVolume(),
+                    this::handleAudioSharingStreamVolumeChanges);
+            mJavaAdapter.alwaysCollectFlow(
+                    mAudioSharingInteractor.isInAudioSharing(),
+                    inSharing -> mInAudioSharing = inSharing);
         }
     }
 
@@ -431,7 +466,11 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     }
 
     private void onNotifyVisibleW(boolean visible) {
-        mAudio.notifyVolumeControllerVisible(mVolumeController, visible);
+        if (Flags.useVolumeController()) {
+            mVolumeControllerAdapter.notifyVolumeControllerVisible(visible);
+        } else {
+            mAudio.notifyVolumeControllerVisible(mVolumeController, visible);
+        }
         if (!visible) {
             if (updateActiveStreamW(-1)) {
                 mCallbacks.onStateChanged(mState);
@@ -499,17 +538,26 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             //       Since their values overlap with DEVICE_OUT_EARPIECE and DEVICE_OUT_SPEAKER.
             //       Anyway, we can check BLE devices by using just DEVICE_OUT_BLE_HEADSET.
             final boolean routedToBluetooth =
-                    (mAudio.getDevicesForStream(AudioManager.STREAM_MUSIC) &
-                            (AudioManager.DEVICE_OUT_BLUETOOTH_A2DP |
-                            AudioManager.DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES |
-                            AudioManager.DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER |
-                            AudioManager.DEVICE_OUT_BLE_HEADSET)) != 0;
+                    // TODO(b/359737651): Need audio support to return broadcast mask.
+                    // For now, mAudio.getDevicesForStream(AudioManager.STREAM_MUSIC) will return
+                    // AudioManager.DEVICE_NONE, so we also need to check if the device is in audio
+                    // sharing here.
+                    mInAudioSharing
+                            || (mAudio.getDevicesForStream(AudioManager.STREAM_MUSIC)
+                                            & (AudioManager.DEVICE_OUT_BLUETOOTH_A2DP
+                                                    | AudioManager
+                                                            .DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES
+                                                    | AudioManager.DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER
+                                                    | AudioManager.DEVICE_OUT_BLE_HEADSET))
+                                    != 0;
             changed |= updateStreamRoutedToBluetoothW(stream, routedToBluetooth);
         } else if (stream == AudioManager.STREAM_VOICE_CALL) {
-            final boolean routedToBluetooth =
-                    (mAudio.getDevicesForStream(AudioManager.STREAM_VOICE_CALL)
-                            & AudioManager.DEVICE_OUT_BLE_HEADSET) != 0;
-            changed |= updateStreamRoutedToBluetoothW(stream, routedToBluetooth);
+            final int devices = mAudio.getDevicesForStream(AudioManager.STREAM_VOICE_CALL);
+            final int bluetoothDevicesMask = (AudioManager.DEVICE_OUT_BLE_HEADSET
+                    | AudioManager.DEVICE_OUT_BLUETOOTH_SCO_HEADSET
+                    | AudioManager.DEVICE_OUT_BLUETOOTH_SCO_CARKIT);
+            changed |= updateStreamRoutedToBluetoothW(stream,
+                    (devices & bluetoothDevicesMask) != 0);
         }
         return changed;
     }
@@ -558,7 +606,13 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
         mState.activeStream = activeStream;
         Events.writeEvent(Events.EVENT_ACTIVE_STREAM_CHANGED, activeStream);
         if (D.BUG) Log.d(TAG, "updateActiveStreamW " + activeStream);
-        final int s = activeStream < DYNAMIC_STREAM_START_INDEX ? activeStream : -1;
+        final int s =
+                activeStream
+                                < (volumeDialogAudioSharingFix()
+                                        ? DYNAMIC_STREAM_BROADCAST
+                                        : DYNAMIC_STREAM_REMOTE_START_INDEX)
+                        ? activeStream
+                        : -1;
         if (D.BUG) Log.d(TAG, "forceVolumeControlStream " + s);
         mAudio.forceVolumeControlStream(s);
         return true;
@@ -633,7 +687,6 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     private static boolean isLogWorthy(int stream) {
         switch (stream) {
             case AudioSystem.STREAM_ALARM:
-            case AudioSystem.STREAM_BLUETOOTH_SCO:
             case AudioSystem.STREAM_MUSIC:
             case AudioSystem.STREAM_RING:
             case AudioSystem.STREAM_SYSTEM:
@@ -758,7 +811,12 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
 
     private void onSetStreamVolumeW(int stream, int level) {
         if (D.BUG) Log.d(TAG, "onSetStreamVolume " + stream + " level=" + level);
-        if (stream >= DYNAMIC_STREAM_START_INDEX) {
+        if (volumeDialogAudioSharingFix() && stream == DYNAMIC_STREAM_BROADCAST) {
+            Slog.d(TAG, "onSetStreamVolumeW set broadcast stream level = " + level);
+            mAudioSharingInteractor.setStreamVolume(level);
+            return;
+        }
+        if (stream >= DYNAMIC_STREAM_REMOTE_START_INDEX) {
             mMediaSessionsCallbacksW.setStreamVolume(stream, level);
             return;
         }
@@ -788,6 +846,41 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     public void showDndTile() {
         if (D.BUG) Log.d(TAG, "showDndTile");
         DndTile.setVisible(mContext, true);
+    }
+
+    void handleAudioSharingStreamVolumeChanges(@Nullable Integer volume) {
+        if (volume == null) {
+            if (mState.states.contains(DYNAMIC_STREAM_BROADCAST)) {
+                mState.states.remove(DYNAMIC_STREAM_BROADCAST);
+                Slog.d(TAG, "Remove audio sharing stream");
+                mCallbacks.onStateChanged(mState);
+            }
+        } else {
+            if (mState.states.contains(DYNAMIC_STREAM_BROADCAST)) {
+                StreamState ss = mState.states.get(DYNAMIC_STREAM_BROADCAST);
+                if (ss.level != volume) {
+                    ss.level = volume;
+                    Slog.d(TAG, "updateState, audio sharing stream volume = " + volume);
+                    mCallbacks.onStateChanged(mState);
+                }
+            } else {
+                StreamState ss = streamStateW(DYNAMIC_STREAM_BROADCAST);
+                ss.dynamic = true;
+                ss.levelMin = mAudioSharingInteractor.getVolumeMin();
+                ss.levelMax = mAudioSharingInteractor.getVolumeMax();
+                ss.routedToBluetooth = true;
+                if (ss.level != volume) {
+                    ss.level = volume;
+                }
+                String label = mContext.getString(R.string.audio_sharing_description);
+                if (!Objects.equals(ss.remoteLabel, label)) {
+                    ss.name = -1;
+                    ss.remoteLabel = label;
+                }
+                Slog.d(TAG, "updateState, new audio sharing stream volume = " + volume);
+                mCallbacks.onStateChanged(mState);
+            }
+        }
     }
 
     private final class VC extends IVolumeController.Stub {
@@ -1239,6 +1332,8 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
 
     private final class Receiver extends BroadcastReceiver {
 
+        private static final int STREAM_UNKNOWN = -1;
+
         public void init() {
             final IntentFilter filter = new IntentFilter();
             filter.addAction(AudioManager.VOLUME_CHANGED_ACTION);
@@ -1260,30 +1355,38 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
             final String action = intent.getAction();
             boolean changed = false;
             if (action.equals(AudioManager.VOLUME_CHANGED_ACTION)) {
-                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
-                final int level = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, -1);
+                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE,
+                        STREAM_UNKNOWN);
                 final int oldLevel = intent
                         .getIntExtra(AudioManager.EXTRA_PREV_VOLUME_STREAM_VALUE, -1);
                 if (D.BUG) Log.d(TAG, "onReceive VOLUME_CHANGED_ACTION stream=" + stream
-                        + " level=" + level + " oldLevel=" + oldLevel);
-                changed = updateStreamLevelW(stream, level);
+                        + " oldLevel=" + oldLevel);
+                if (stream != STREAM_UNKNOWN) {
+                    changed |= onVolumeChangedW(stream, 0);
+                }
             } else if (action.equals(AudioManager.STREAM_DEVICES_CHANGED_ACTION)) {
-                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
+                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE,
+                        STREAM_UNKNOWN);
                 final int devices = intent
                         .getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_DEVICES, -1);
                 final int oldDevices = intent
                         .getIntExtra(AudioManager.EXTRA_PREV_VOLUME_STREAM_DEVICES, -1);
                 if (D.BUG) Log.d(TAG, "onReceive STREAM_DEVICES_CHANGED_ACTION stream="
                         + stream + " devices=" + devices + " oldDevices=" + oldDevices);
-                changed = checkRoutedToBluetoothW(stream);
-                changed |= onVolumeChangedW(stream, 0);
+                if (stream != STREAM_UNKNOWN) {
+                    changed |= checkRoutedToBluetoothW(stream);
+                    changed |= onVolumeChangedW(stream, 0);
+                }
             } else if (action.equals(AudioManager.STREAM_MUTE_CHANGED_ACTION)) {
-                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
+                final int stream = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE,
+                        STREAM_UNKNOWN);
                 final boolean muted = intent
                         .getBooleanExtra(AudioManager.EXTRA_STREAM_VOLUME_MUTED, false);
                 if (D.BUG) Log.d(TAG, "onReceive STREAM_MUTE_CHANGED_ACTION stream=" + stream
                         + " muted=" + muted);
-                changed = updateStreamMuteW(stream, muted);
+                if (stream != STREAM_UNKNOWN) {
+                    changed = updateStreamMuteW(stream, muted);
+                }
             } else if (action.equals(NotificationManager.ACTION_EFFECTS_SUPPRESSOR_CHANGED)) {
                 if (D.BUG) Log.d(TAG, "onReceive ACTION_EFFECTS_SUPPRESSOR_CHANGED");
                 changed = updateEffectsSuppressorW(mNoMan.getEffectsSuppressor());
@@ -1306,7 +1409,7 @@ public class VolumeDialogControllerImpl implements VolumeDialogController, Dumpa
     protected final class MediaSessionsCallbacks implements MediaSessions.Callbacks {
         private final HashMap<Token, Integer> mRemoteStreams = new HashMap<>();
 
-        private int mNextStream = DYNAMIC_STREAM_START_INDEX;
+        private int mNextStream = DYNAMIC_STREAM_REMOTE_START_INDEX;
         private final boolean mVolumeAdjustmentForRemoteGroupSessions;
 
         public MediaSessionsCallbacks(Context context) {
